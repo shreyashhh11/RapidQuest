@@ -1,237 +1,245 @@
-const OpenAI = require('openai');
+const fs = require('fs').promises;
+const path = require('path');
 
 class SearchService {
-  constructor(database) {
-    this.db = database;
-    this.openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-    this.embeddingModel = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
-  }
-
-  async generateEmbedding(text) {
-    try {
-      if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY === 'your_openai_api_key_here') {
-        console.warn('⚠️ OpenAI API key not configured. Using fallback search method.');
-        return null;
-      }
-
-      const response = await this.openai.embeddings.create({
-        model: this.embeddingModel,
-        input: text,
-      });
-
-      return response.data[0].embedding;
-    } catch (error) {
-      console.error('Error generating embedding:', error);
-      return null;
-    }
-  }
-
-  async storeDocument(filename, content, chunks) {
-    try {
-      // Store document and chunks in database
-      const documentId = await this.db.storeDocument(filename, content, chunks);
-      
-      // Generate embeddings for chunks
-      const embeddings = await Promise.all(
-        chunks.map(chunk => this.generateEmbedding(chunk))
-      );
-      
-      // Store embeddings in database
-      if (embeddings.some(emb => emb !== null)) {
-        await this.db.storeChunksWithEmbeddings(documentId, chunks, embeddings);
-      }
-      
-      console.log(`✅ Stored document: ${filename} (${chunks.length} chunks)`);
-      return documentId;
-    } catch (error) {
-      console.error('Error storing document:', error);
-      throw error;
-    }
-  }
-
-  async search(query, limit = 10) {
-    try {
-      console.log(`🔍 Searching for: "${query}" (limit: ${limit})`);
-      
-      // Generate embedding for the query
-      const queryEmbedding = await this.generateEmbedding(query);
-      
-      // Search in database
-      let results;
-      if (queryEmbedding) {
-        results = await this.db.searchBySimilarity(JSON.stringify(queryEmbedding), limit);
-      } else {
-        // Fallback to basic content search if embedding fails
-        results = await this.basicContentSearch(query, limit);
-      }
-      
-      // Enhance results with relevance scoring
-      const enhancedResults = results.map(result => {
-        const relevanceScore = this.calculateRelevanceScore(query, result.content);
-        return {
-          ...result,
-          relevanceScore: Math.round(relevanceScore * 100) / 100,
-          excerpt: this.createExcerpt(result.content, query, 200)
-        };
-      });
-      
-      // Sort by relevance score
-      enhancedResults.sort((a, b) => b.relevanceScore - a.relevanceScore);
-      
-      console.log(`✅ Found ${enhancedResults.length} results`);
-      return enhancedResults;
-    } catch (error) {
-      console.error('Search error:', error);
-      throw error;
-    }
-  }
-
-  async basicContentSearch(query, limit = 10) {
-    try {
-      const chunks = await this.db.getAllChunks(limit * 3); // Get more chunks to filter
-      
-      // Simple text matching
-      const queryWords = query.toLowerCase().split(/\s+/);
-      
-      return chunks
-        .map(chunk => {
-          const contentLower = chunk.content.toLowerCase();
-          const score = queryWords.reduce((sum, word) => {
-            return sum + (contentLower.includes(word) ? 1 : 0);
-          }, 0);
-          
-          return {
-            ...chunk,
-            score: score
-          };
-        })
-        .filter(chunk => chunk.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit);
-    } catch (error) {
-      console.error('Basic search error:', error);
-      return [];
-    }
-  }
-
-  calculateRelevanceScore(query, content) {
-    const queryWords = query.toLowerCase().split(/\s+/);
-    const contentLower = content.toLowerCase();
-    
-    let score = 0;
-    
-    // Exact phrase matches get highest score
-    if (contentLower.includes(query.toLowerCase())) {
-      score += 10;
-    }
-    
-    // Individual word matches
-    queryWords.forEach(word => {
-      if (word.length > 2) {
-        const wordCount = (contentLower.match(new RegExp(word, 'g')) || []).length;
-        score += wordCount;
-      }
-    });
-    
-    // Word proximity bonus
-    queryWords.forEach((word, i) => {
-      if (i < queryWords.length - 1) {
-        const nextWord = queryWords[i + 1];
-        if (contentLower.includes(word + ' ' + nextWord)) {
-          score += 2;
+    constructor(database) {
+        this.db = database;
+        this.openai = null; // Will be set to OpenAI client if API key is available
+        
+        // Only initialize OpenAI if API key is available
+        if (process.env.OPENAI_API_KEY && 
+            process.env.OPENAI_API_KEY !== 'your_openai_api_key_here' &&
+            process.env.OPENAI_API_KEY.trim() !== '') {
+            try {
+                const { OpenAI } = require('openai');
+                this.openai = new OpenAI({ 
+                    apiKey: process.env.OPENAI_API_KEY 
+                });
+                this.embeddingModel = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
+                console.log('✅ OpenAI initialized for semantic search');
+            } catch (error) {
+                console.warn('OpenAI not available:', error.message);
+                this.openai = null;
+            }
+        } else {
+            console.log('⚠️ OpenAI API key not configured. Using fallback text search method.');
         }
-      }
-    });
-    
-    // Content length normalization
-    const contentWords = contentLower.split(/\s+/).length;
-    if (contentWords > 0) {
-      score = score / Math.sqrt(contentWords);
     }
-    
-    return score;
-  }
 
-  createExcerpt(content, query, maxLength = 200) {
-    const contentLower = content.toLowerCase();
-    const queryLower = query.toLowerCase();
-    
-    const queryIndex = contentLower.indexOf(queryLower);
-    
-    if (queryIndex !== -1) {
-      // Center the excerpt around the query
-      const start = Math.max(0, queryIndex - maxLength / 2);
-      const end = Math.min(content.length, start + maxLength);
-      
-      let excerpt = content.substring(start, end);
-      
-      // Add ellipsis if we're not at the beginning
-      if (start > 0) {
-        excerpt = '...' + excerpt;
-      }
-      
-      // Add ellipsis if we're not at the end
-      if (end < content.length) {
-        excerpt = excerpt + '...';
-      }
-      
-      return excerpt;
-    } else {
-      // Return first part if query not found
-      return content.substring(0, maxLength) + (content.length > maxLength ? '...' : '');
+    // Generate embedding for text content
+    async generateEmbedding(text) {
+        if (!this.openai) {
+            return null; // No OpenAI, return null
+        }
+
+        try {
+            const response = await this.openai.embeddings.create({
+                model: this.embeddingModel,
+                input: text
+            });
+
+            return JSON.stringify(response.data[0].embedding);
+        } catch (error) {
+            console.warn('Failed to generate embedding:', error.message);
+            return null;
+        }
     }
-  }
 
-  async getStats() {
-    try {
-      const stats = await this.db.getStats();
-      return {
-        ...stats,
-        embeddingModel: this.embeddingModel,
-        openaiConfigured: !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'your_openai_api_key_here')
-      };
-    } catch (error) {
-      console.error('Error getting stats:', error);
-      throw error;
-    }
-  }
-
-  // Utility method for text similarity (fallback if OpenAI fails)
-  calculateTextSimilarity(text1, text2) {
-    const words1 = text1.toLowerCase().split(/\s+/);
-    const words2 = text2.toLowerCase().split(/\s+/);
-    
-    const commonWords = words1.filter(word => 
-      words2.includes(word) && word.length > 2
-    );
-    
-    const uniqueWords = new Set([...words1, ...words2]);
-    
-    return commonWords.length / uniqueWords.size;
-  }
-
-  // Method to reindex all documents (useful if embedding model changes)
-  async reindexAllDocuments() {
-    try {
-      const documents = await this.db.getAllDocuments();
-      
-      for (const doc of documents) {
-        console.log(`🔄 Reindexing: ${doc.filename}`);
+    // Split text into chunks for processing
+    splitTextIntoChunks(text, chunkSize = 1000, overlap = 100) {
+        const words = text.split(/\s+/);
+        const chunks = [];
         
-        // Get chunks for this document
-        // Note: This is a simplified version - you'd need to implement this properly
+        for (let i = 0; i < words.length; i += chunkSize - overlap) {
+            const chunk = words.slice(i, i + chunkSize).join(' ');
+            if (chunk.trim()) {
+                chunks.push(chunk);
+            }
+        }
         
-        console.log(`✅ Reindexed: ${doc.filename}`);
-      }
-      
-      console.log('✅ Reindexing complete');
-    } catch (error) {
-      console.error('Reindexing error:', error);
-      throw error;
+        return chunks;
     }
-  }
+
+    // Calculate cosine similarity between two vectors
+    cosineSimilarity(vecA, vecB) {
+        if (!vecA || !vecB) {
+            return 0;
+        }
+
+        try {
+            const vectorA = JSON.parse(vecA);
+            const vectorB = JSON.parse(vecB);
+            
+            if (!Array.isArray(vectorA) || !Array.isArray(vectorB) || vectorA.length !== vectorB.length) {
+                return 0;
+            }
+
+            let dotProduct = 0;
+            let normA = 0;
+            let normB = 0;
+
+            for (let i = 0; i < vectorA.length; i++) {
+                dotProduct += vectorA[i] * vectorB[i];
+                normA += vectorA[i] * vectorA[i];
+                normB += vectorB[i] * vectorB[i];
+            }
+
+            const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+            return denominator === 0 ? 0 : dotProduct / denominator;
+        } catch (error) {
+            return 0;
+        }
+    }
+
+    // Fallback text-based search when OpenAI is not available
+    async textSearch(query, limit = 10) {
+        console.log(`Performing text search for: "${query}"`);
+        
+        const documents = await this.db.getAllDocuments();
+        const results = [];
+        const queryWords = query.toLowerCase().split(/\s+/).filter(word => word.length > 2);
+
+        for (const doc of documents) {
+            if (doc.content) {
+                const content = doc.content.toLowerCase();
+                let score = 0;
+                let matchedChunks = [];
+
+                // Find matching chunks and calculate relevance score
+                const textChunks = this.splitTextIntoChunks(content, 500, 50);
+                
+                for (const chunk of textChunks) {
+                    let chunkScore = 0;
+                    let matchedWords = [];
+
+                    for (const queryWord of queryWords) {
+                        const regex = new RegExp(`\\b${queryWord}\\b`, 'gi');
+                        const matches = chunk.match(regex);
+                        if (matches) {
+                            chunkScore += matches.length;
+                            matchedWords.push(queryWord);
+                        }
+                    }
+
+                    if (chunkScore > 0) {
+                        matchedChunks.push({
+                            text: chunk,
+                            score: chunkScore,
+                            matchedWords: matchedWords
+                        });
+                    }
+                }
+
+                if (matchedChunks.length > 0) {
+                    // Sort chunks by score and take the best ones
+                    matchedChunks.sort((a, b) => b.score - a.score);
+                    
+                    // Calculate overall document score
+                    const overallScore = matchedChunks.reduce((sum, chunk) => sum + chunk.score, 0);
+                    
+                    results.push({
+                        id: doc.id,
+                        filename: doc.filename,
+                        content: doc.content,
+                        wordCount: doc.wordCount,
+                        pageCount: doc.pageCount,
+                        uploadedAt: doc.uploadedAt,
+                        score: overallScore,
+                        chunks: matchedChunks.slice(0, 3) // Top 3 chunks
+                    });
+                }
+            }
+        }
+
+        // Sort by score and return top results
+        results.sort((a, b) => b.score - a.score);
+        return results.slice(0, limit);
+    }
+
+    // Semantic search using OpenAI embeddings
+    async semanticSearch(query, limit = 10) {
+        if (!this.openai) {
+            throw new Error('OpenAI not configured for semantic search');
+        }
+
+        try {
+            const queryEmbedding = await this.generateEmbedding(query);
+            if (!queryEmbedding) {
+                throw new Error('Failed to generate query embedding');
+            }
+            
+            const documents = await this.db.getAllDocuments();
+            const results = [];
+
+            for (const doc of documents) {
+                if (doc.embedding) {
+                    const similarity = this.cosineSimilarity(queryEmbedding, doc.embedding);
+                    if (similarity > 0.1) { // Minimum similarity threshold
+                        results.push({
+                            id: doc.id,
+                            filename: doc.filename,
+                            content: doc.content,
+                            wordCount: doc.wordCount,
+                            pageCount: doc.pageCount,
+                            uploadedAt: doc.uploadedAt,
+                            score: similarity
+                        });
+                    }
+                }
+            }
+
+            // Sort by similarity and return top results
+            results.sort((a, b) => b.score - a.score);
+            return results.slice(0, limit);
+
+        } catch (error) {
+            console.error('Semantic search error:', error);
+            throw error;
+        }
+    }
+
+    // Main search function that handles both semantic and text search
+    async search(query, limit = 10) {
+        try {
+            let searchResults = [];
+            
+            if (this.openai) {
+                try {
+                    searchResults = await this.semanticSearch(query, limit);
+                    console.log(`Semantic search completed: ${searchResults.length} results`);
+                } catch (error) {
+                    console.warn('Semantic search failed, falling back to text search:', error.message);
+                    searchResults = await this.textSearch(query, limit);
+                }
+            } else {
+                searchResults = await this.textSearch(query, limit);
+            }
+
+            return searchResults;
+
+        } catch (error) {
+            console.error('Search error:', error);
+            
+            // Always try text search as fallback
+            try {
+                const fallbackResults = await this.textSearch(query, limit);
+                return fallbackResults;
+            } catch (fallbackError) {
+                console.error('Fallback search also failed:', fallbackError);
+                throw fallbackError;
+            }
+        }
+    }
+
+    // Get recent searches from search history
+    async getRecentSearches(limit = 10) {
+        try {
+            return await this.db.getSearchHistory();
+        } catch (error) {
+            console.warn('Failed to get search history:', error.message);
+            return [];
+        }
+    }
 }
 
 module.exports = SearchService;
